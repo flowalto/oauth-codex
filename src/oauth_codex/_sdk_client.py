@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any, cast
 
@@ -32,6 +33,33 @@ def _with_auth_headers(
     if auth_headers:
         merged.update(auth_headers)
     return merged
+
+
+def _iter_sse_events(payload: str) -> Iterator[dict[str, Any]]:
+    for block in payload.split("\n\n"):
+        if not block.strip():
+            continue
+
+        data_lines: list[str] = []
+        event_name: str | None = None
+
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event_name = line[len("event:") :].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:") :].strip())
+
+        if not data_lines:
+            continue
+
+        event_data = json.loads("\n".join(data_lines))
+        if isinstance(event_data, dict):
+            event_data.setdefault("raw", event_data)
+            if event_name and "type" not in event_data:
+                event_data["type"] = event_name
+            yield event_data
+
+
 def _payload_without_none(values: dict[str, Any]) -> dict[str, Any]:
     payload = {k: v for k, v in values.items() if v is not None}
     payload.pop("self", None)
@@ -61,10 +89,7 @@ class _SyncEngine:
         payload = dict(payload)
         payload["stream"] = True
         response = self._client.request("POST", "/responses", json_data=payload)
-        events = response.json()
-        if isinstance(events, list):
-            for event in events:
-                yield event
+        yield from _iter_sse_events(response.text)
 
 
 class _AsyncEngine:
@@ -90,10 +115,8 @@ class _AsyncEngine:
         payload = dict(payload)
         payload["stream"] = True
         response = await self._client.request("POST", "/responses", json_data=payload)
-        events = response.json()
-        if isinstance(events, list):
-            for event in events:
-                yield event
+        for event in _iter_sse_events(response.text):
+            yield event
 
 
 class Client(SyncAPIClient):

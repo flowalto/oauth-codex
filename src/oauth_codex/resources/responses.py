@@ -6,7 +6,7 @@ from typing import Any
 from oauth_codex._models import BaseModel
 from oauth_codex.tooling import (
     build_strict_response_format,
-    callable_to_tool_schema,
+    normalize_tool_inputs,
     to_responses_tools,
 )
 
@@ -34,14 +34,7 @@ def _normalize_response_format(response_format: Any) -> Any:
 def _normalize_tools(tools: Any) -> Any:
     if not isinstance(tools, list):
         return tools
-
-    normalized: list[Any] = []
-    for tool in tools:
-        if callable(tool):
-            normalized.extend(to_responses_tools([callable_to_tool_schema(tool)]))
-            continue
-        normalized.append(tool)
-    return normalized
+    return to_responses_tools(normalize_tool_inputs(tools))
 
 
 def _extract_response_output_text(response: Response) -> str:

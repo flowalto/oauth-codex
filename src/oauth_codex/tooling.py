@@ -336,6 +336,13 @@ def callable_to_tool_schema(func: Any) -> ToolSchema:
 
 
 def _normalize_dict_tool(tool: dict[str, Any]) -> ToolSchema:
+    # Pass through built-in/non-function tool dicts (e.g. {"type": "web_search"}).
+    # A built-in has a non-"function" type string and lacks both a nested "function" key
+    # and a top-level "name" key — function tools always have at least one of those.
+    tool_type = tool.get("type")
+    if tool_type is not None and tool_type != "function" and "function" not in tool and "name" not in tool:
+        return tool  # type: ignore[return-value]
+
     if tool.get("type") == "function" and "function" in tool and isinstance(tool["function"], dict):
         fn = tool["function"]
         return {
@@ -387,6 +394,10 @@ def to_responses_tools(
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for tool in tools:
+        # Pass through built-in/non-function tool dicts (e.g. {"type": "web_search"}).
+        if isinstance(tool, dict) and tool.get("type") != "function":
+            normalized.append(dict(tool))
+            continue
         item: dict[str, Any] = {
             "type": "function",
             "name": tool["name"],

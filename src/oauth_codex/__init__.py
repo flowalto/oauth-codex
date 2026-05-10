@@ -19,7 +19,10 @@ from ._exceptions import (
     UnprocessableEntityError,
 )
 from ._version import __title__, __version__
+from .auth._oauth import OAuthProvider
 from .core_types import listMessage
+from .registry import ProviderSpec, get_provider_spec, list_provider_ids
+from .store import FileTokenStore
 
 __all__ = [
     "types",
@@ -42,4 +45,9 @@ __all__ = [
     "UnprocessableEntityError",
     "RateLimitError",
     "InternalServerError",
+    "OAuthProvider",
+    "FileTokenStore",
+    "ProviderSpec",
+    "get_provider_spec",
+    "list_provider_ids",
 ]

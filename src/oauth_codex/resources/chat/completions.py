@@ -6,9 +6,10 @@ import time
 import uuid
 from typing import Any
 
+from oauth_codex._exceptions import BadRequestError
 from oauth_codex.tooling import (
     build_strict_response_format,
-    callable_to_tool_schema,
+    normalize_tool_inputs,
     to_responses_tools,
 )
 from oauth_codex.types.chat.completions import ChatCompletion
@@ -37,14 +38,118 @@ def _normalize_response_format(response_format: Any) -> Any:
 def _normalize_tools(tools: Any) -> Any:
     if not isinstance(tools, list):
         return tools
+    return to_responses_tools(normalize_tool_inputs(tools))
 
-    normalized: list[Any] = []
-    for tool in tools:
-        if callable(tool):
-            normalized.extend(to_responses_tools([callable_to_tool_schema(tool)]))
+
+def _normalize_tool_call_item(tool_call: Any) -> dict[str, Any] | None:
+    if isinstance(tool_call, dict):
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            return None
+        call_id = tool_call.get("id") or tool_call.get("call_id")
+        name = function.get("name")
+        arguments = function.get("arguments")
+    else:
+        function = getattr(tool_call, "function", None)
+        call_id = getattr(tool_call, "id", None) or getattr(tool_call, "call_id", None)
+        name = getattr(function, "name", None)
+        arguments = getattr(function, "arguments", None)
+
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    if isinstance(arguments, dict):
+        arguments = json.dumps(arguments)
+    if not isinstance(arguments, str):
+        arguments = "{}"
+
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+def _translate_content_parts(content: Any) -> Any:
+    """Translate Chat Completions content part types to Responses API types.
+
+    Chat Completions uses ``"text"`` and ``"image_url"`` part types, while the
+    Responses API requires ``"input_text"`` and ``"input_image"``.  Plain string
+    content is returned unchanged.
+    """
+    if not isinstance(content, list):
+        return content
+    translated: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            translated.append(part)
             continue
-        normalized.append(tool)
-    return normalized
+        part_type = part.get("type")
+        if part_type == "text":
+            translated.append({**part, "type": "input_text"})
+        elif part_type == "image_url":
+            image_url_value = part.get("image_url")
+            url = (
+                image_url_value.get("url")
+                if isinstance(image_url_value, dict)
+                else image_url_value
+            )
+            translated.append({"type": "input_image", "image_url": url})
+        else:
+            translated.append(part)
+    return translated
+
+
+def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    response_items: list[dict[str, Any]] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        item_type = message.get("type")
+        if item_type in {"function_call", "function_call_output"}:
+            response_items.append(dict(message))
+            continue
+
+        role = message.get("role")
+
+        if role == "tool":
+            call_id = message.get("tool_call_id") or message.get("call_id")
+            if isinstance(call_id, str) and call_id.strip():
+                response_items.append(
+                    _build_function_call_output_item(
+                        tool_call_id=call_id,
+                        output=message.get("content", ""),
+                    )
+                )
+            continue
+
+        if role == "assistant":
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                content = message.get("content")
+                if isinstance(content, str) and content:
+                    response_items.append({"role": "assistant", "content": content})
+                elif isinstance(content, list) and content:
+                    response_items.append(
+                        {"role": "assistant", "content": _translate_content_parts(content)}
+                    )
+
+                for tool_call in tool_calls:
+                    normalized_tool_call = _normalize_tool_call_item(tool_call)
+                    if normalized_tool_call is not None:
+                        response_items.append(normalized_tool_call)
+                continue
+
+        content = message.get("content")
+        if content is None:
+            continue
+        response_items.append({"role": role, "content": _translate_content_parts(content)})
+
+    return response_items
 
 
 def _parse_text_with_model(response_format: type[Any], text: str) -> Any:
@@ -260,6 +365,72 @@ def _to_chat_completion(
     )
 
 
+def _to_chat_completion_from_stream_events(
+    *, events: list[Any], requested_model: str
+) -> ChatCompletion:
+    response_data: dict[str, Any] | None = None
+    output_chunks: list[str] = []
+    output_items: dict[str, dict[str, Any]] = {}
+    output_item_order: list[str] = []
+    function_argument_chunks: dict[str, list[str]] = {}
+
+    for event in events:
+        raw_event = getattr(event, "raw", None)
+        if not isinstance(raw_event, dict):
+            continue
+
+        event_type = raw_event.get("type")
+        if event_type == "response.output_text.delta":
+            delta = raw_event.get("delta")
+            if isinstance(delta, str):
+                output_chunks.append(delta)
+        elif event_type in {"response.output_item.added", "response.output_item.done"}:
+            item = raw_event.get("item")
+            if isinstance(item, dict):
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id:
+                    existing = output_items.get(item_id, {})
+                    merged_item = {**existing, **item}
+                    if item_id in function_argument_chunks and not merged_item.get("arguments"):
+                        merged_item["arguments"] = "".join(function_argument_chunks[item_id])
+                    output_items[item_id] = merged_item
+                    if item_id not in output_item_order:
+                        output_item_order.append(item_id)
+        elif event_type == "response.function_call_arguments.delta":
+            item_id = raw_event.get("item_id")
+            delta = raw_event.get("delta")
+            if isinstance(item_id, str) and item_id and isinstance(delta, str):
+                function_argument_chunks.setdefault(item_id, []).append(delta)
+        elif event_type == "response.function_call_arguments.done":
+            item_id = raw_event.get("item_id")
+            arguments = raw_event.get("arguments")
+            if isinstance(item_id, str) and item_id:
+                if not isinstance(arguments, str):
+                    arguments = "".join(function_argument_chunks.get(item_id, []))
+                existing = output_items.get(item_id, {"id": item_id, "type": "function_call"})
+                existing["arguments"] = arguments
+                output_items[item_id] = existing
+                if item_id not in output_item_order:
+                    output_item_order.append(item_id)
+        elif event_type == "response.completed":
+            response_payload = raw_event.get("response")
+            if isinstance(response_payload, dict):
+                response_data = response_payload
+
+    if response_data is None:
+        raise ValueError("No response.completed event found in streamed response")
+
+    response_data = dict(response_data)
+    response_data.setdefault("output_text", "".join(output_chunks))
+    if not response_data.get("output") and output_item_order:
+        response_data["output"] = [
+            output_items[item_id]
+            for item_id in output_item_order
+            if item_id in output_items
+        ]
+    return _to_chat_completion(response_data=response_data, requested_model=requested_model)
+
+
 class Completions:
     def __init__(self, client: Any) -> None:
         self._client = client
@@ -275,11 +446,29 @@ class Completions:
         if "tools" in payload:
             payload["tools"] = _normalize_tools(payload["tools"])
         payload["model"] = model
-        payload["input"] = messages
+        payload["input"] = _messages_to_responses_input(messages)
 
-        response = self._client.responses.create(**payload)
-        response_data = response.to_dict(exclude_unset=False, exclude_none=False)
-        return _to_chat_completion(response_data=response_data, requested_model=model)
+        try:
+            response = self._client.responses.create(**payload)
+            response_data = response.to_dict(exclude_unset=False, exclude_none=False)
+            return _to_chat_completion(response_data=response_data, requested_model=model)
+        except BadRequestError as exc:
+            response = getattr(exc, "response", None)
+            detail = None
+            if response is not None:
+                try:
+                    detail = response.text
+                except Exception:
+                    detail = None
+
+            if not detail or "Stream must be set to true" not in detail:
+                raise
+
+            events = list(self._client.responses.stream(**payload))
+            return _to_chat_completion_from_stream_events(
+                events=events,
+                requested_model=model,
+            )
 
     def parse(
         self,
@@ -401,7 +590,7 @@ class AsyncCompletions:
         if "tools" in payload:
             payload["tools"] = _normalize_tools(payload["tools"])
         payload["model"] = model
-        payload["input"] = messages
+        payload["input"] = _messages_to_responses_input(messages)
 
         response = await self._client.responses.create(**payload)
         response_data = response.to_dict(exclude_unset=False, exclude_none=False)

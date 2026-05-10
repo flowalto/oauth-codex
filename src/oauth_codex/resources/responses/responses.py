@@ -7,7 +7,7 @@ from ..._resource import AsyncAPIResource, SyncAPIResource
 from ...core_types import Message, ToolInput, ToolResult, TruncationMode, ValidationMode
 from ...tooling import (
     build_strict_response_format,
-    callable_to_tool_schema,
+    normalize_tool_inputs,
     to_responses_tools,
 )
 from ...types.responses import Response, ResponseStreamEvent
@@ -51,14 +51,7 @@ def _normalize_response_format(response_format: Any) -> Any:
 def _normalize_tools(tools: list[ToolInput] | None) -> list[Any] | None:
     if not isinstance(tools, list):
         return tools
-
-    normalized: list[Any] = []
-    for tool in tools:
-        if callable(tool):
-            normalized.extend(to_responses_tools([callable_to_tool_schema(tool)]))
-            continue
-        normalized.append(tool)
-    return normalized
+    return to_responses_tools(normalize_tool_inputs(tools))
 
 
 def _parse_text_with_model(response_format: type[Any], text: str) -> Any:
@@ -172,6 +165,9 @@ class Responses(SyncAPIResource):
     ) -> Response | Iterator[ResponseStreamEvent]:
         response_format = _normalize_response_format(response_format)
         tools = _normalize_tools(tools)
+        strict_output_param = strict_output if strict_output else None
+        store_param = store
+        parallel_tool_calls_param = parallel_tool_calls if parallel_tool_calls else None
         out = self._client._engine.responses_create(
             model=model,
             input=input,
@@ -180,8 +176,8 @@ class Responses(SyncAPIResource):
             tool_results=tool_results,
             response_format=response_format,
             tool_choice=tool_choice,
-            strict_output=strict_output,
-            store=store,
+            strict_output=strict_output_param,
+            store=store_param,
             reasoning=reasoning,
             previous_response_id=previous_response_id,
             instructions=instructions,
@@ -191,7 +187,7 @@ class Responses(SyncAPIResource):
             metadata=metadata,
             include=include,
             max_tool_calls=max_tool_calls,
-            parallel_tool_calls=parallel_tool_calls,
+            parallel_tool_calls=parallel_tool_calls_param,
             truncation=truncation,
             extra_headers=extra_headers,
             extra_query=extra_query,
@@ -401,6 +397,9 @@ class AsyncResponses(AsyncAPIResource):
     ) -> Response | AsyncIterator[ResponseStreamEvent]:
         response_format = _normalize_response_format(response_format)
         tools = _normalize_tools(tools)
+        strict_output_param = strict_output if strict_output else None
+        store_param = store
+        parallel_tool_calls_param = parallel_tool_calls if parallel_tool_calls else None
         out = await self._client._engine.aresponses_create(
             model=model,
             input=input,
@@ -409,8 +408,8 @@ class AsyncResponses(AsyncAPIResource):
             tool_results=tool_results,
             response_format=response_format,
             tool_choice=tool_choice,
-            strict_output=strict_output,
-            store=store,
+            strict_output=strict_output_param,
+            store=store_param,
             reasoning=reasoning,
             previous_response_id=previous_response_id,
             instructions=instructions,
@@ -420,7 +419,7 @@ class AsyncResponses(AsyncAPIResource):
             metadata=metadata,
             include=include,
             max_tool_calls=max_tool_calls,
-            parallel_tool_calls=parallel_tool_calls,
+            parallel_tool_calls=parallel_tool_calls_param,
             truncation=truncation,
             extra_headers=extra_headers,
             extra_query=extra_query,

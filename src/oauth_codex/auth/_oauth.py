@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
+import webbrowser
 from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse as _urlparse
 
 import httpx
 
@@ -20,7 +25,7 @@ from oauth_codex.auth import (
 )
 from oauth_codex.auth.config import OAuthConfig
 from oauth_codex.core_types import OAuthTokens, TokenStore
-from oauth_codex.store import FallbackTokenStore
+from oauth_codex.store import build_default_token_store
 
 from ._provider import Headers
 
@@ -33,14 +38,12 @@ class OAuthProvider:
         oauth_config: OAuthConfig | None = None,
         timeout: float = 30.0,
         refresh_leeway_seconds: int = 30,
-        prompt_callback: Callable[[str], str] | None = None,
         output_callback: Callable[[str], None] | None = None,
     ) -> None:
-        self._token_store = token_store or FallbackTokenStore()
+        self._token_store = token_store or build_default_token_store()
         self._oauth_config = load_oauth_config(oauth_config)
         self._timeout = timeout
         self._refresh_leeway_seconds = max(0, refresh_leeway_seconds)
-        self._prompt_callback = prompt_callback or input
         self._output_callback = output_callback or print
 
     def ensure_valid(self, *, interactive: bool = True) -> None:
@@ -67,11 +70,52 @@ class OAuthProvider:
                 self._oauth_config, state, code_challenge
             )
 
-            self._output_callback("Open this URL in your browser and complete sign-in:")
-            self._output_callback(authorize_url)
-            callback_url = self._prompt_callback(
-                "Paste the full localhost callback URL: "
-            ).strip()
+            parsed_redirect = _urlparse(self._oauth_config.redirect_uri)
+            callback_host = parsed_redirect.hostname or "localhost"
+            callback_port = parsed_redirect.port or 1455
+            callback_path = parsed_redirect.path or "/auth/callback"
+
+            callback_queue: queue.Queue[str] = queue.Queue()
+
+            class _CallbackHandler(BaseHTTPRequestHandler):
+                def do_GET(self_handler) -> None:
+                    if self_handler.path.startswith(callback_path):
+                        full_url = f"http://{callback_host}:{callback_port}{self_handler.path}"
+                        self_handler.send_response(200)
+                        self_handler.send_header("Content-Type", "text/html; charset=utf-8")
+                        self_handler.end_headers()
+                        self_handler.wfile.write(
+                            b"<html><body style='font-family:sans-serif;padding:2em'>"
+                            b"<h2>Authentication successful!</h2>"
+                            b"<p>You can close this tab and return to the application.</p>"
+                            b"</body></html>"
+                        )
+                        callback_queue.put(full_url)
+                    else:
+                        self_handler.send_response(204)
+                        self_handler.end_headers()
+
+                def log_message(self_handler, format: str, *args: object) -> None:
+                    pass  # suppress access logs
+
+            server = HTTPServer((callback_host, callback_port), _CallbackHandler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+
+            self._output_callback("Opening browser for authentication...")
+            if not webbrowser.open(authorize_url):
+                self._output_callback(
+                    f"Could not open browser automatically. Open this URL manually:\n{authorize_url}"
+                )
+
+            try:
+                callback_url = callback_queue.get(timeout=120)
+            except queue.Empty:
+                raise AuthRequiredError(
+                    "OAuth login timed out waiting for browser callback (2 minutes)"
+                )
+            finally:
+                server.shutdown()
 
             code = parse_callback_url(callback_url, state)
             tokens = exchange_code_for_tokens(

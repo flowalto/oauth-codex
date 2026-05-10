@@ -70,6 +70,17 @@ client.authenticate()
 
 On first authentication, the SDK prints an authorization URL, waits for the browser sign-in flow, and asks you to paste the localhost callback URL back into the terminal. Tokens are stored locally and refreshed automatically on later requests.
 
+By default, oauth-codex stores tokens in the OS keyring when available. If keyring storage fails, it falls back to a per-user file in the platform-native config directory, such as `%LOCALAPPDATA%\\oauth-codex\\auth.json` on Windows, `~/Library/Application Support/oauth-codex/auth.json` on macOS, or `~/.config/oauth-codex/auth.json` on Linux. Legacy `~/.oauth_codex/auth.json` files are migrated automatically when read.
+
+For deterministic deployments on clean machines, you can control the storage backend explicitly:
+
+- `CODEX_OAUTH_TOKEN_STORE=auto` uses keyring first, then file fallback.
+- `CODEX_OAUTH_TOKEN_STORE=keyring` requires OS keyring storage and fails if keyring is unavailable.
+- `CODEX_OAUTH_TOKEN_STORE=file` always uses the file backend.
+- `CODEX_OAUTH_TOKEN_PATH=/absolute/path/to/auth.json` overrides the file location when using file storage or auto fallback.
+
+For headless servers, use `CODEX_OAUTH_TOKEN_STORE=file` and set `CODEX_OAUTH_TOKEN_PATH` to a deployment-managed per-user secret path if you do not want keyring-dependent behavior.
+
 ## Main API Surface
 
 ### Chat Completions
